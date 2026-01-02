@@ -264,16 +264,44 @@ def process_video(input_path, output_path, args):
     # Step 4: Mux (unless --srt-only)
     if not args.srt_only:
         print("\n[5/5] Muxing subtitles into video...")
-        subprocess.run([
-            "mkvmerge", "-o", str(output_path), str(input_path),
-            "--language", "0:eng", "--track-name", "0:English", str(english_srt)
-        ], capture_output=True, check=True)
+
+        # Build mkvmerge command
+        mux_cmd = ["mkvmerge", "-o", str(output_path), str(input_path)]
+
+        # Add English subtitles (always default)
+        mux_cmd.extend([
+            "--language", "0:eng",
+            "--track-name", "0:English",
+            "--default-track", "0:yes",
+            str(english_srt)
+        ])
+
+        # Add source language subtitles if requested (for translation mode)
+        if args.keep_source_subs and args.translate and args.source_lang != "en" and source_srt.exists():
+            # Language name mapping for track names
+            lang_names = {
+                "es": "Spanish", "pt": "Portuguese", "fr": "French",
+                "de": "German", "it": "Italian", "ja": "Japanese",
+                "ko": "Korean", "zh": "Chinese", "ru": "Russian", "ar": "Arabic"
+            }
+            lang_name = lang_names.get(args.source_lang, args.source_lang.upper())
+
+            mux_cmd.extend([
+                "--language", f"0:{args.source_lang}",
+                "--track-name", f"0:{lang_name}",
+                "--default-track", "0:no",
+                str(source_srt)
+            ])
+            print(f"  Including both English (default) and {lang_name} subtitles")
+
+        subprocess.run(mux_cmd, capture_output=True, check=True)
         print(f"  Created: {output_path}")
 
     # Cleanup temp files
     if not args.keep_temp:
         audio_path.unlink(missing_ok=True)
-        if args.translate:
+        # Keep source SRT if --keep-source-subs is set (for --srt-only mode)
+        if args.translate and not args.keep_source_subs:
             source_srt.unlink(missing_ok=True)
         if not args.srt_only:
             english_srt.unlink(missing_ok=True)
@@ -327,6 +355,8 @@ Examples:
                         help="NLLB model directory (default: ./models/nllb-ct2)")
     parser.add_argument("--srt-only", action="store_true",
                         help="Only generate SRT file, don't mux into video")
+    parser.add_argument("--keep-source-subs", action="store_true",
+                        help="Include source language subtitles alongside English (translation mode only)")
     parser.add_argument("--keep-temp", action="store_true",
                         help="Keep intermediate files (audio, source SRT)")
     args = parser.parse_args()
