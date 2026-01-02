@@ -1,0 +1,23 @@
+#!/bin/bash
+# Wrapper script to set cuDNN library path before running Python
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Find nvidia libs in venv or user site-packages
+for PYVER in python3.12 python3.11 python3.10; do
+    NVIDIA_PATH="$SCRIPT_DIR/.venv/lib/$PYVER/site-packages/nvidia"
+    if [ -d "$NVIDIA_PATH" ]; then
+        break
+    fi
+    NVIDIA_PATH="$HOME/.local/lib/$PYVER/site-packages/nvidia"
+    if [ -d "$NVIDIA_PATH" ]; then
+        break
+    fi
+done
+
+if [ -d "$NVIDIA_PATH/cudnn/lib" ]; then
+    export LD_LIBRARY_PATH="$NVIDIA_PATH/cudnn/lib:$NVIDIA_PATH/cublas/lib:${LD_LIBRARY_PATH:-}"
+fi
+
+# Run the Python script with all arguments
+exec python3 "$SCRIPT_DIR/generate_subtitles.py" "$@"
