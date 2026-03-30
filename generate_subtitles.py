@@ -12,10 +12,15 @@ Usage:
 Requirements:
   pip install faster-whisper pysrt tqdm
   pip install ctranslate2 transformers  # only if using --translate
+  pip install IndicTransToolkit          # only if using --translate with Tamil
 
 For translation, first run the NLLB model setup:
   ct2-transformers-converter --model facebook/nllb-200-3.3B \
     --output_dir ./models/nllb-ct2 --quantization int8_float16
+
+For Tamil translation, download the IndicTrans2 model:
+  huggingface-cli download ai4bharat/indictrans2-indic-en-1B \
+    --local-dir ./models/indictrans2-indic-en-1B
 """
 
 # Fix cuDNN library path - preload libraries before CUDA imports
@@ -210,6 +215,77 @@ def translate_srt(srt_path, output_path, src_lang, model_dir):
     subs.save(str(output_path), encoding='utf-8')
 
 
+def translate_srt_indictrans(srt_path, output_path, model_dir):
+    """Translate SRT file from Tamil to English using IndicTrans2."""
+    try:
+        import torch
+        from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
+        from IndicTransToolkit.processor import IndicProcessor
+    except ImportError:
+        print("Missing IndicTrans2 dependencies. Run: pip install IndicTransToolkit")
+        sys.exit(1)
+
+    model_path = Path(model_dir)
+    if not model_path.exists():
+        print(f"IndicTrans2 model not found at {model_dir}")
+        print("Run the following to download it:")
+        print(f"  huggingface-cli download ai4bharat/indictrans2-indic-en-1B \\")
+        print(f"    --local-dir {model_dir}")
+        sys.exit(1)
+
+    print(f"  Loading IndicTrans2 model...")
+    tokenizer = AutoTokenizer.from_pretrained(str(model_dir), trust_remote_code=True)
+    model = AutoModelForSeq2SeqLM.from_pretrained(
+        str(model_dir),
+        trust_remote_code=True,
+        torch_dtype=torch.float16,
+    ).to("cuda")
+    model.eval()
+
+    ip = IndicProcessor(inference=True)
+
+    subs = pysrt.open(str(srt_path), encoding='utf-8')
+    texts = [sub.text for sub in subs]
+    translated = []
+
+    BATCH_SIZE = 32
+    print(f"  Translating {len(texts)} segments...")
+    for i in tqdm(range(0, len(texts), BATCH_SIZE), desc="  Batches"):
+        batch = texts[i:i+BATCH_SIZE]
+
+        # Preprocess
+        preprocessed = ip.preprocess_batch(batch, src_lang="tam_Taml", tgt_lang="eng_Latn")
+
+        # Tokenize
+        inputs = tokenizer(
+            preprocessed,
+            padding="longest",
+            truncation=True,
+            max_length=256,
+            return_tensors="pt",
+        ).to("cuda")
+
+        # Generate
+        with torch.no_grad():
+            generated = model.generate(
+                **inputs,
+                num_beams=5,
+                max_length=256,
+            )
+
+        # Decode
+        with tokenizer.as_target_tokenizer():
+            decoded = tokenizer.batch_decode(generated, skip_special_tokens=True)
+
+        # Postprocess
+        postprocessed = ip.postprocess_batch(decoded, lang="eng_Latn")
+        translated.extend(postprocessed)
+
+    for sub, trans in zip(subs, translated):
+        sub.text = trans
+    subs.save(str(output_path), encoding='utf-8')
+
+
 # NLLB language code mapping (Whisper code -> NLLB code)
 NLLB_CODES = {
     "es": "spa_Latn",
@@ -251,11 +327,14 @@ def process_video(input_path, output_path, args):
         segments_to_srt(segments, source_srt)
 
         print("\n[4/4] Translating to English...")
-        nllb_code = NLLB_CODES.get(args.source_lang)
-        if not nllb_code:
-            print(f"Warning: Unknown language '{args.source_lang}', using Spanish (spa_Latn)")
-            nllb_code = "spa_Latn"
-        translate_srt(source_srt, english_srt, nllb_code, args.model_dir)
+        if args.source_lang == "ta":
+            translate_srt_indictrans(source_srt, english_srt, args.indictrans_model_dir)
+        else:
+            nllb_code = NLLB_CODES.get(args.source_lang)
+            if not nllb_code:
+                print(f"Warning: Unknown language '{args.source_lang}', using Spanish (spa_Latn)")
+                nllb_code = "spa_Latn"
+            translate_srt(source_srt, english_srt, nllb_code, args.model_dir)
     else:
         print("\n[3/4] Saving subtitles...")
         segments_to_srt(segments, english_srt)
@@ -282,7 +361,8 @@ def process_video(input_path, output_path, args):
             lang_names = {
                 "es": "Spanish", "pt": "Portuguese", "fr": "French",
                 "de": "German", "it": "Italian", "ja": "Japanese",
-                "ko": "Korean", "zh": "Chinese", "ru": "Russian", "ar": "Arabic"
+                "ko": "Korean", "zh": "Chinese", "ru": "Russian", "ar": "Arabic",
+                "ta": "Tamil"
             }
             lang_name = lang_names.get(args.source_lang, args.source_lang.upper())
 
@@ -328,6 +408,7 @@ Examples:
   Single file:
     %(prog)s -i movie.mkv                    # English source
     %(prog)s -i pelicula.mkv -s es -t        # Spanish -> English
+    %(prog)s -i movie.mkv -s ta -t           # Tamil -> English (IndicTrans2)
 
   Batch processing:
     %(prog)s --input-dir ./queue --originals-dir ./originals --processed-dir ./done
@@ -345,7 +426,7 @@ Examples:
 
     # Common options
     parser.add_argument("--source-lang", "-s", default="en",
-                        help="Source language code: en, es, pt, fr, de, ja, ko, zh, ru, ar (default: en)")
+                        help="Source language code: en, es, pt, fr, de, ja, ko, zh, ru, ar, ta (default: en)")
     parser.add_argument("--translate", "-t", action="store_true",
                         help="Translate to English (required for non-English source)")
     parser.add_argument("--quality", "-q", default="default",
@@ -353,6 +434,8 @@ Examples:
                         help="Quality preset: default (fast), high (no VAD, catches all), sensitive (relaxed VAD)")
     parser.add_argument("--model-dir", default="./models/nllb-ct2",
                         help="NLLB model directory (default: ./models/nllb-ct2)")
+    parser.add_argument("--indictrans-model-dir", default="./models/indictrans2-indic-en-1B",
+                        help="IndicTrans2 model directory for Tamil (default: ./models/indictrans2-indic-en-1B)")
     parser.add_argument("--srt-only", action="store_true",
                         help="Only generate SRT file, don't mux into video")
     parser.add_argument("--keep-source-subs", action="store_true",
