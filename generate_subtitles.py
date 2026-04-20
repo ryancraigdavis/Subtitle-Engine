@@ -13,6 +13,7 @@ Requirements:
   pip install faster-whisper pysrt tqdm
   pip install ctranslate2 transformers  # only if using --translate
   pip install IndicTransToolkit          # only if using --translate with Tamil
+  pip install vllm                       # only if using --translate with PLaMo
 
 For translation, first run the NLLB model setup:
   ct2-transformers-converter --model facebook/nllb-200-3.3B \
@@ -21,6 +22,10 @@ For translation, first run the NLLB model setup:
 For Tamil translation, download the IndicTrans2 model:
   huggingface-cli download ai4bharat/indictrans2-indic-en-1B \
     --local-dir ./models/indictrans2-indic-en-1B
+
+For Japanese translation with PLaMo 2, download the model (~19GB):
+  huggingface-cli download pfnet/plamo-2-translate \
+    --local-dir ./models/plamo-2-translate
 """
 
 # Fix cuDNN library path - preload libraries before CUDA imports
@@ -286,6 +291,66 @@ def translate_srt_indictrans(srt_path, output_path, model_dir):
     subs.save(str(output_path), encoding='utf-8')
 
 
+def translate_srt_plamo(srt_path, output_path, model_dir):
+    """Translate SRT file from Japanese to English using PLaMo 2 Translate."""
+    try:
+        import vllm
+    except ImportError:
+        print("Missing PLaMo dependencies. Run: pip install vllm")
+        sys.exit(1)
+
+    model_path = Path(model_dir)
+    if not model_path.exists():
+        print(f"PLaMo 2 Translate model not found at {model_dir}")
+        print("Run the following to download it:")
+        print(f"  huggingface-cli download pfnet/plamo-2-translate \\")
+        print(f"    --local-dir {model_dir}")
+        sys.exit(1)
+
+    print(f"  Loading PLaMo 2 Translate model...")
+    llm = vllm.LLM(
+        model=str(model_dir),
+        trust_remote_code=True,
+        max_model_len=256,
+        max_num_batched_tokens=256,
+        gpu_memory_utilization=0.90,
+        quantization="bitsandbytes",
+        load_format="bitsandbytes",
+        dtype="bfloat16",
+    )
+
+    subs = pysrt.open(str(srt_path), encoding='utf-8')
+    texts = [sub.text for sub in subs]
+
+    # Build prompts for all segments
+    prompts = []
+    for text in texts:
+        prompt = (
+            "<|plamo:op|>dataset\n"
+            "translation\n"
+            "<|plamo:op|>input lang=Japanese\n"
+            f"{text}\n"
+            "<|plamo:op|>output lang=English\n"
+        )
+        prompts.append(prompt)
+
+    sampling_params = vllm.SamplingParams(
+        temperature=0,
+        max_tokens=256,
+        stop=["<|plamo:op|>"],
+    )
+
+    print(f"  Translating {len(prompts)} segments...")
+    responses = llm.generate(prompts, sampling_params)
+
+    # vLLM may reorder responses; sort by request_id to match input order
+    responses.sort(key=lambda r: int(r.request_id))
+
+    for sub, response in zip(subs, responses):
+        sub.text = response.outputs[0].text.strip()
+    subs.save(str(output_path), encoding='utf-8')
+
+
 # NLLB language code mapping (Whisper code -> NLLB code)
 NLLB_CODES = {
     "es": "spa_Latn",
@@ -326,8 +391,18 @@ def process_video(input_path, output_path, args):
         print("\n[3/4] Saving source subtitles...")
         segments_to_srt(segments, source_srt)
 
-        print("\n[4/4] Translating to English...")
-        if args.source_lang == "ta":
+        # Resolve translator: auto picks best engine per language
+        translator = args.translator
+        if translator == "auto":
+            if args.source_lang == "ta":
+                translator = "indictrans"
+            else:
+                translator = "nllb"
+
+        print(f"\n[4/4] Translating to English ({translator})...")
+        if translator == "plamo":
+            translate_srt_plamo(source_srt, english_srt, args.plamo_model_dir)
+        elif translator == "indictrans":
             translate_srt_indictrans(source_srt, english_srt, args.indictrans_model_dir)
         else:
             nllb_code = NLLB_CODES.get(args.source_lang)
@@ -409,6 +484,8 @@ Examples:
     %(prog)s -i movie.mkv                    # English source
     %(prog)s -i pelicula.mkv -s es -t        # Spanish -> English
     %(prog)s -i movie.mkv -s ta -t           # Tamil -> English (IndicTrans2)
+    %(prog)s -i anime.mkv -s ja -t --translator plamo  # Japanese -> English (PLaMo 2)
+    %(prog)s -i anime.mkv -s ja -t              # Japanese -> English (NLLB, default)
 
   Batch processing:
     %(prog)s --input-dir ./queue --originals-dir ./originals --processed-dir ./done
@@ -429,6 +506,11 @@ Examples:
                         help="Source language code: en, es, pt, fr, de, ja, ko, zh, ru, ar, ta (default: en)")
     parser.add_argument("--translate", "-t", action="store_true",
                         help="Translate to English (required for non-English source)")
+    parser.add_argument("--translator", default="auto",
+                        choices=["auto", "nllb", "plamo", "indictrans"],
+                        help="Translation engine: auto (NLLB for most, IndicTrans for Tamil), "
+                             "nllb, plamo (Japanese via PLaMo 2), indictrans (Tamil via IndicTrans2) "
+                             "(default: auto)")
     parser.add_argument("--quality", "-q", default="default",
                         choices=["default", "high", "sensitive"],
                         help="Quality preset: default (fast), high (no VAD, catches all), sensitive (relaxed VAD)")
@@ -436,6 +518,8 @@ Examples:
                         help="NLLB model directory (default: ./models/nllb-ct2)")
     parser.add_argument("--indictrans-model-dir", default="./models/indictrans2-indic-en-1B",
                         help="IndicTrans2 model directory for Tamil (default: ./models/indictrans2-indic-en-1B)")
+    parser.add_argument("--plamo-model-dir", default="./models/plamo-2-translate",
+                        help="PLaMo 2 Translate model directory for Japanese (default: ./models/plamo-2-translate)")
     parser.add_argument("--srt-only", action="store_true",
                         help="Only generate SRT file, don't mux into video")
     parser.add_argument("--keep-source-subs", action="store_true",
