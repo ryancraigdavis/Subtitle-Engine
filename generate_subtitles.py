@@ -57,6 +57,7 @@ def _preload_cuda_libs():
 _preload_cuda_libs()
 
 import argparse
+import json
 import subprocess
 import sys
 from pathlib import Path
@@ -76,6 +77,37 @@ def extract_audio(video_path, audio_path):
         "ffmpeg", "-i", str(video_path),
         "-vn", "-ac", "1", "-ar", "16000", "-acodec", "pcm_s16le",
         str(audio_path), "-y"
+    ], capture_output=True, check=True)
+
+
+# Only text-based subtitle codecs can be losslessly converted to SRT.
+# Image-based subs (PGS/VobSub/DVB) would need OCR and aren't supported here.
+TEXT_SUB_CODECS = {"subrip", "srt", "ass", "ssa", "webvtt", "mov_text", "text"}
+
+
+def has_subtitle_streams(video_path):
+    """Return True if ffprobe reports any text-based subtitle stream."""
+    try:
+        result = subprocess.run([
+            "ffprobe", "-v", "error",
+            "-show_streams", "-print_format", "json",
+            str(video_path)
+        ], capture_output=True, text=True, check=True)
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return False
+    streams = json.loads(result.stdout).get("streams", [])
+    return any(
+        s.get("codec_type") == "subtitle" and s.get("codec_name") in TEXT_SUB_CODECS
+        for s in streams
+    )
+
+
+def extract_existing_subs(video_path, srt_path):
+    """Extract the first subtitle stream to an SRT file (converts mov_text -> srt)."""
+    subprocess.run([
+        "ffmpeg", "-i", str(video_path),
+        "-map", "0:s:0", "-c:s", "srt",
+        str(srt_path), "-y"
     ], capture_output=True, check=True)
 
 
@@ -377,19 +409,54 @@ def process_video(input_path, output_path, args):
 
     print(f"\nProcessing: {input_path.name}")
 
-    # Step 1: Extract audio
-    print("\n[1/4] Extracting audio...")
-    extract_audio(input_path, audio_path)
+    # Check for existing subtitle streams (e.g., mov_text in mp4) -- if present,
+    # extract them and skip AI transcription. On any extraction failure, fall
+    # through to the normal transcription path.
+    extracted_existing_subs = False
+    if has_subtitle_streams(input_path):
+        extract_target = source_srt if (args.translate and args.source_lang != "en") else english_srt
+        print(f"\nFound existing subtitles, extracting to {extract_target.name}...")
+        try:
+            extract_existing_subs(input_path, extract_target)
+            extracted_existing_subs = True
+        except subprocess.CalledProcessError as e:
+            print(f"  Warning: subtitle extraction failed ({e.returncode}), falling back to AI transcription")
+            extract_target.unlink(missing_ok=True)
 
-    # Step 2: Transcribe
-    print("\n[2/4] Transcribing...")
-    segments = transcribe(audio_path, args.source_lang, args.quality)
-    print(f"  Found {len(segments)} segments")
+    # Ensure input is in MKV container (remux without re-encoding if needed).
+    # Drop subtitles from the remux (-sn) since mkv doesn't support mov_text and
+    # we already extracted them (or will re-add a fresh SRT from transcription).
+    converted_mkv = None
+    if input_path.suffix.lower() != ".mkv":
+        print(f"\nConverting {input_path.suffix} to MKV container...")
+        converted_mkv = work_dir / f"{input_path.stem}_remuxed.mkv"
+        subprocess.run(
+            ["ffmpeg", "-i", str(input_path), "-c", "copy", "-sn", str(converted_mkv), "-y"],
+            capture_output=True, check=True,
+        )
+        input_path = converted_mkv
+        # Force output to .mkv since mkvmerge only outputs MKV
+        if output_path.suffix.lower() != ".mkv":
+            output_path = output_path.with_suffix(".mkv")
+
+    # Steps 1 & 2: Extract audio + transcribe (skip if existing subs were extracted)
+    if not extracted_existing_subs:
+        print("\n[1/4] Extracting audio...")
+        extract_audio(input_path, audio_path)
+
+        print("\n[2/4] Transcribing...")
+        segments = transcribe(audio_path, args.source_lang, args.quality)
+        print(f"  Found {len(segments)} segments")
+    else:
+        print("\n[1/4] Skipping audio extraction (using existing subtitles)")
+        print("\n[2/4] Skipping transcription (using existing subtitles)")
+        segments = None
 
     # Step 3: Save/Translate
     if args.translate and args.source_lang != "en":
-        print("\n[3/4] Saving source subtitles...")
-        segments_to_srt(segments, source_srt)
+        if not extracted_existing_subs:
+            print("\n[3/4] Saving source subtitles...")
+            segments_to_srt(segments, source_srt)
 
         # Resolve translator: auto picks best engine per language
         translator = args.translator
@@ -411,8 +478,11 @@ def process_video(input_path, output_path, args):
                 nllb_code = "spa_Latn"
             translate_srt(source_srt, english_srt, nllb_code, args.model_dir)
     else:
-        print("\n[3/4] Saving subtitles...")
-        segments_to_srt(segments, english_srt)
+        if not extracted_existing_subs:
+            print("\n[3/4] Saving subtitles...")
+            segments_to_srt(segments, english_srt)
+        else:
+            print("\n[3/4] Using extracted subtitles")
         print("\n[4/4] Skipping translation (English source)")
 
     # Step 4: Mux (unless --srt-only)
@@ -460,6 +530,8 @@ def process_video(input_path, output_path, args):
             source_srt.unlink(missing_ok=True)
         if not args.srt_only:
             english_srt.unlink(missing_ok=True)
+        if converted_mkv is not None:
+            converted_mkv.unlink(missing_ok=True)
 
     return output_path if not args.srt_only else english_srt
 
